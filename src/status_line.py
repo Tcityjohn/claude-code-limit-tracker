@@ -2,109 +2,123 @@
 """
 Status line generator for Claude Code integration.
 Reads JSON input from stdin and outputs formatted status line.
+
+Focuses on context window usage - the key metric for predicting
+when Claude's response quality may start to degrade.
 """
 
 import json
 import sys
-import time
 import os
+import select
 from pathlib import Path
-from tracker import UsageTracker
-from config import Config
 from git_info import GitInfo
+
+def read_stdin_data() -> dict:
+    """Read JSON data passed via stdin from Claude Code."""
+    stdin_data = {}
+
+    try:
+        # Check if there's data available on stdin (non-blocking)
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            raw_input = sys.stdin.read()
+            if raw_input.strip():
+                try:
+                    stdin_data = json.loads(raw_input)
+                except json.JSONDecodeError:
+                    pass
+    except:
+        pass
+
+    return stdin_data
+
+def get_context_color(percentage: float) -> tuple:
+    """Get RGB color based on context usage percentage."""
+    if percentage < 40:
+        return (0, 255, 0)      # Green - safe zone
+    elif percentage < 65:
+        return (255, 255, 0)    # Yellow - getting warm
+    elif percentage < 80:
+        return (255, 165, 0)    # Orange - caution, consider wrapping up
+    else:
+        return (255, 100, 100)  # Red - danger zone, quality may degrade
 
 def generate_status_line():
     """Generate status line output for Claude Code."""
-    
+
+    # Read data from Claude Code via stdin
+    stdin_data = read_stdin_data()
+
     # Get current project name from working directory
     try:
         project_path = os.getcwd()
         project_name = Path(project_path).name
-        
-        # If we're in the tracker directory, use that
-        if project_name == 'claude-code-usage-tracking':
-            project_name = 'usage-tracker'
     except:
         project_name = 'unknown'
-    
-    # Initialize components
-    config = Config()
-    tracker = UsageTracker()
-    git_info = GitInfo(cache_duration=config.git_cache_duration)
-    
-    # Get current usage data
-    usage = tracker.update()
-    limits = config.get_tier_limits()
-    
-    # Calculate time remaining in 5h cycle
-    now = time.time()
-    cycle_end = usage.current_5h_start + (5 * 3600)
-    time_remaining = cycle_end - now
-    
+
+    # Initialize git info
+    git_info = GitInfo(cache_duration=5)
+
     # Format parts
     parts = []
-    
+
     # Project name
     parts.append(f"📁 {project_name}")
-    
-    # Add git information if enabled
-    if config.show_git_info:
-        git_status = git_info.get_git_status(project_path)
-        git_display = git_info.format_git_info(git_status)
-        if git_display:
-            parts.append(git_display)
-    
-    # Current model - try multiple detection methods
+
+    # Add git information
+    git_status = git_info.get_git_status(project_path)
+    git_display = git_info.format_git_info(git_status)
+    if git_display:
+        parts.append(git_display)
+
+    # Current model - use stdin data if available (most accurate)
     current_model = "Sonnet 4"  # Default
-    
-    # Method 1: Check environment variables
-    claude_model = os.environ.get('CLAUDE_MODEL', '').lower()
-    if 'opus' in claude_model:
-        current_model = "Opus 4"
-    elif 'sonnet' in claude_model:
-        current_model = "Sonnet 4"
+    if stdin_data.get('model', {}).get('display_name'):
+        model_name = stdin_data['model']['display_name']
+        model_id = stdin_data['model'].get('id', '')
+        if 'Opus' in model_name:
+            current_model = "Opus 4.5" if "4.5" in model_name or "4-5" in model_id else "Opus 4"
+        elif 'Sonnet' in model_name:
+            current_model = "Sonnet 4"
     else:
-        # Method 2: Read from Claude settings.json
-        try:
-            settings_path = Path.home() / ".claude" / "settings.json"
-            if settings_path.exists():
-                with open(settings_path, 'r') as f:
-                    settings = json.load(f)
-                    model_setting = settings.get('model', '').lower()
-                    if 'opus' in model_setting:
-                        current_model = "Opus 4"
-                    elif 'sonnet' in model_setting:
-                        current_model = "Sonnet 4"
-        except:
-            # Method 3: Fallback to recent session analysis
-            if usage.sessions:
-                recent = usage.sessions[-1]
-                if recent.opus_responses > recent.sonnet_responses:
-                    current_model = "Opus 4"
-    
+        # Fallback to environment variable
+        claude_model = os.environ.get('CLAUDE_MODEL', '').lower()
+        if 'opus' in claude_model:
+            current_model = "Opus 4"
+
     parts.append(f"🤖 {current_model}")
-    
-    # 5-hour cycle usage
-    color = config.get_usage_color(usage.current_5h_prompts, limits.cycle_5h_max)
-    percentage = int((usage.current_5h_prompts / limits.cycle_5h_max) * 100) if limits.cycle_5h_max > 0 else 0
-    parts.append(f"\033[38;2;{color[0]};{color[1]};{color[2]}m⚡{usage.current_5h_prompts}/{limits.cycle_5h_max}p ({percentage}%)\033[0m")
-    
-    # Weekly usage based on tier
-    if config.tier in ['max_5x', 'max_20x']:
-        # Show both Sonnet and Opus
-        sonnet_color = config.get_usage_color(usage.weekly_sonnet_hours, limits.weekly_sonnet_max)
-        opus_color = config.get_usage_color(usage.weekly_opus_hours, limits.weekly_opus_max or 0)
-        
-        parts.append(f"\033[38;2;{sonnet_color[0]};{sonnet_color[1]};{sonnet_color[2]}m📅 S4: {usage.weekly_sonnet_hours:.1f}h/{limits.weekly_sonnet_max}h\033[0m")
-        parts.append(f"\033[38;2;{opus_color[0]};{opus_color[1]};{opus_color[2]}mO4: {usage.weekly_opus_hours:.1f}h/{limits.weekly_opus_max or 0}h\033[0m")
-    else:
-        # Free/Pro - Sonnet only
-        color = config.get_usage_color(usage.weekly_sonnet_hours, limits.weekly_sonnet_max)
-        parts.append(f"\033[38;2;{color[0]};{color[1]};{color[2]}m📅 {usage.weekly_sonnet_hours:.1f}h/{limits.weekly_sonnet_max}h\033[0m")
-    
-    # Time until reset
-    parts.append(f"🔄 {config.format_time_remaining(time_remaining)}")
-    
+
+    # Context window usage - the key metric
+    ctx_window = stdin_data.get('context_window', {})
+    if ctx_window:
+        ctx_used_pct = ctx_window.get('used_percentage', 0)
+        ctx_window_size = ctx_window.get('context_window_size', 200000)
+
+        # Calculate actual tokens in context (includes cached conversation)
+        current_usage = ctx_window.get('current_usage', {})
+        actual_context_tokens = (
+            current_usage.get('cache_read_input_tokens', 0) +
+            current_usage.get('cache_creation_input_tokens', 0) +
+            current_usage.get('input_tokens', 0) +
+            current_usage.get('output_tokens', 0)
+        )
+
+        # If we couldn't get current_usage, estimate from percentage
+        if actual_context_tokens == 0 and ctx_used_pct > 0:
+            actual_context_tokens = int(ctx_window_size * ctx_used_pct / 100)
+
+        tokens_k = actual_context_tokens // 1000
+        window_k = ctx_window_size // 1000
+
+        # Color based on usage
+        ctx_color = get_context_color(ctx_used_pct)
+
+        # Context display with warning at 65%+
+        if ctx_used_pct >= 65:
+            parts.append(f"\033[38;2;{ctx_color[0]};{ctx_color[1]};{ctx_color[2]}m⚠️ CTX:{ctx_used_pct}% ({tokens_k}k/{window_k}k)\033[0m")
+        else:
+            parts.append(f"\033[38;2;{ctx_color[0]};{ctx_color[1]};{ctx_color[2]}m📊 CTX:{ctx_used_pct}% ({tokens_k}k/{window_k}k)\033[0m")
+
     # Output the status line
     status_line = " | ".join(parts)
     print(status_line)

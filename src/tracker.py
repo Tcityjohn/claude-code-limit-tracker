@@ -26,6 +26,14 @@ class SessionData:
     project: str
 
 @dataclass
+class ContextData:
+    """Context window usage data."""
+    estimated_tokens: int
+    context_limit: int
+    percentage: float
+    warning_threshold: float = 45.0
+
+@dataclass
 class UsageData:
     """Complete usage data structure."""
     current_5h_prompts: int
@@ -36,6 +44,7 @@ class UsageData:
     weekly_start: float
     last_updated: float
     sessions: List[SessionData]
+    context: Optional[ContextData] = None
 
 class UsageTracker:
     """Main usage tracker with optimized performance."""
@@ -73,6 +82,112 @@ class UsageTracker:
         hours_since_epoch = now / 3600
         cycle_number = int(hours_since_epoch / 5)
         return cycle_number * 5 * 3600
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count from text (~4 chars per token)."""
+        if not text:
+            return 0
+        return len(text) // 4
+
+    def estimate_context_usage(self, project_path: Optional[str] = None) -> Optional[ContextData]:
+        """
+        Estimate context window usage for the current session.
+        Uses ~4 chars per token heuristic against 200k context limit.
+        """
+        CONTEXT_LIMIT = 200000  # Opus 4.5 context window
+        WARNING_THRESHOLD = 45.0
+
+        # Find current session file
+        if project_path is None:
+            project_path = os.getcwd()
+
+        # Claude stores sessions in ~/.claude/projects/<encoded-path>/
+        # The folder name is the path with slashes replaced by dashes
+        encoded_path = project_path.replace('/', '-')
+        project_dir = self.claude_projects / encoded_path
+
+        # Fallback: find most recently modified project if exact match not found
+        if not project_dir.exists() and self.claude_projects.exists():
+            # Find all project dirs with recent activity
+            recent_dirs = []
+            for pdir in self.claude_projects.iterdir():
+                if pdir.is_dir() and not pdir.name.startswith('.'):
+                    jsonl_files = list(pdir.glob('*.jsonl'))
+                    if jsonl_files:
+                        most_recent = max(jsonl_files, key=lambda f: f.stat().st_mtime)
+                        mtime = most_recent.stat().st_mtime
+                        # Only consider files modified in last 5 minutes (active session)
+                        if (time.time() - mtime) < 300:
+                            recent_dirs.append((pdir, mtime))
+
+            if recent_dirs:
+                # Use the most recently modified project
+                project_dir = max(recent_dirs, key=lambda x: x[1])[0]
+
+        if not project_dir or not project_dir.exists():
+            return None
+
+        # Find most recent session file
+        jsonl_files = list(project_dir.glob('*.jsonl'))
+        if not jsonl_files:
+            return None
+
+        current_session = max(jsonl_files, key=lambda f: f.stat().st_mtime)
+
+        # Estimate tokens from session file
+        # Use file size as proxy, with ~6 chars per token (accounting for JSON overhead)
+        # This gives a reasonable estimate of actual context window usage
+        try:
+            file_size = current_session.stat().st_size
+
+            # Also count actual content for more accuracy
+            total_content_chars = 0
+            with open(current_session, 'r') as f:
+                for line in f:
+                    try:
+                        msg = json.loads(line)
+                        # Skip non-message entries
+                        if msg.get('type') not in ('user', 'assistant'):
+                            continue
+
+                        content = msg.get('message', {}).get('content', '')
+
+                        if isinstance(content, str):
+                            total_content_chars += len(content)
+                        elif isinstance(content, list):
+                            # Handle array content (tool_use, tool_result, text blocks)
+                            for item in content:
+                                if isinstance(item, dict):
+                                    # Count text content
+                                    if text := item.get('text', ''):
+                                        total_content_chars += len(text)
+                                    # Count tool input/output
+                                    if inp := item.get('input'):
+                                        total_content_chars += len(json.dumps(inp))
+                                    if content_blocks := item.get('content'):
+                                        if isinstance(content_blocks, list):
+                                            for cb in content_blocks:
+                                                if isinstance(cb, dict) and (t := cb.get('text')):
+                                                    total_content_chars += len(t)
+                    except:
+                        continue
+
+            # Use the larger of: file-based estimate or content-based estimate
+            # File-based: ~6 chars/token (accounts for JSON overhead)
+            # Content-based: ~4 chars/token (raw text)
+            file_based_tokens = file_size // 6
+            content_based_tokens = total_content_chars // 4
+            estimated_tokens = max(file_based_tokens, content_based_tokens)
+        except:
+            return None
+        percentage = (estimated_tokens / CONTEXT_LIMIT) * 100
+
+        return ContextData(
+            estimated_tokens=estimated_tokens,
+            context_limit=CONTEXT_LIMIT,
+            percentage=round(percentage, 1),
+            warning_threshold=WARNING_THRESHOLD
+        )
     
     def _parse_timestamp(self, ts: str) -> Optional[float]:
         """Parse ISO timestamp to epoch seconds efficiently."""
@@ -216,6 +331,9 @@ class UsageTracker:
                 sonnet_hours += session.duration_hours * sonnet_ratio
                 opus_hours += session.duration_hours * opus_ratio
         
+        # Get context usage for current session
+        context_data = self.estimate_context_usage()
+
         return UsageData(
             current_5h_prompts=cycle_prompts,
             current_5h_start=self.cycle_5h_start,
@@ -224,7 +342,8 @@ class UsageTracker:
             weekly_prompts=weekly_prompts,
             weekly_start=self.week_start,
             last_updated=time.time(),
-            sessions=week_sessions
+            sessions=week_sessions,
+            context=context_data
         )
     
     def save_usage_data(self, usage_data: UsageData):
